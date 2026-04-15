@@ -9,15 +9,20 @@ Endpoints:
     POST /v1/completions        — Text completions (streaming & non-streaming)
     GET  /v1/models             — List available models
     GET  /health                — Health check
+    POST /shutdown              — Gracefully shutdown the server and all processes
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
 import json
+import os
+import signal
+import sys
 import time
 import threading
 import uuid
+import gc
 from dataclasses import dataclass, field
 from typing import AsyncGenerator, List, Optional, Union
 
@@ -161,9 +166,56 @@ class AsyncEngineWrapper:
         self._thread.start()
 
     def shutdown(self):
+        """Thoroughly clean up all engine resources, child processes, and GPU memory."""
+        print("[server] Shutting down engine...")
         self._running = False
-        self._has_work.set()
-        self._thread.join(timeout=10)
+        self._has_work.set()  # Wake up the engine loop so it can exit
+
+        # Wait for engine loop thread to finish
+        if self._thread.is_alive():
+            self._thread.join(timeout=15)
+            if self._thread.is_alive():
+                print("[server] WARNING: Engine loop thread did not exit cleanly")
+
+        # Resolve any remaining pending futures with cancellation
+        with self._lock:
+            for pending in self._pending.values():
+                if not pending.future.done():
+                    pending.loop.call_soon_threadsafe(
+                        pending.future.cancel
+                    )
+                if pending.stream and pending.token_queue is not None:
+                    try:
+                        pending.loop.call_soon_threadsafe(
+                            pending.token_queue.put_nowait, None
+                        )
+                    except Exception:
+                        pass
+            self._pending.clear()
+            self._seq_prev_tokens.clear()
+
+        # Shut down the LLM engine (which cleans up model_runner, dist, shm, child processes)
+        try:
+            self.engine.exit()
+        except Exception as e:
+            print(f"[server] WARNING: Error during engine exit: {e}")
+
+        # Release references to allow GC
+        del self.engine
+        del self.tokenizer
+
+        # Force GPU memory release
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+        except Exception:
+            pass
+
+        # Force garbage collection
+        gc.collect()
+        print("[server] Engine shutdown complete.")
 
     def add_request(
         self,
@@ -299,7 +351,7 @@ class AsyncEngineWrapper:
 # FastAPI application
 # ============================================================
 
-def create_app(engine: AsyncEngineWrapper) -> FastAPI:
+def create_app(engine: AsyncEngineWrapper, shutdown_event: asyncio.Event | None = None) -> FastAPI:
     app = FastAPI(title="nanovllm API Server", version="0.1.0")
 
     # ----------------------------------------------------------
@@ -308,6 +360,16 @@ def create_app(engine: AsyncEngineWrapper) -> FastAPI:
     @app.get("/health")
     async def health():
         return {"status": "ok"}
+
+    # ----------------------------------------------------------
+    # Shutdown endpoint — gracefully stop the server
+    # ----------------------------------------------------------
+    @app.post("/shutdown")
+    async def shutdown():
+        """Gracefully shutdown the server, clean up all processes and GPU resources."""
+        if shutdown_event is not None:
+            shutdown_event.set()
+        return {"status": "shutting_down", "message": "Server is shutting down..."}
 
     # ----------------------------------------------------------
     # List models
@@ -509,42 +571,187 @@ def create_app(engine: AsyncEngineWrapper) -> FastAPI:
 
 
 # ============================================================
+# Graceful cleanup utilities
+# ============================================================
+
+def _kill_child_processes():
+    """Kill all child processes spawned by this server (TP workers etc.)."""
+    import multiprocessing
+    current = os.getpid()
+    try:
+        import psutil
+        parent = psutil.Process(current)
+        children = parent.children(recursive=True)
+        for child in children:
+            print(f"[server] Terminating child process PID={child.pid}")
+            child.terminate()
+        gone, alive = psutil.wait_procs(children, timeout=5)
+        for p in alive:
+            print(f"[server] Force killing child process PID={p.pid}")
+            p.kill()
+    except ImportError:
+        # psutil not available, use os-level signal
+        try:
+            # Send SIGTERM to the entire process group
+            os.killpg(os.getpgid(current), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def _cleanup_shared_memory():
+    """Clean up any leaked shared memory segments."""
+    try:
+        from multiprocessing.shared_memory import SharedMemory
+        for name in ["nanovllm"]:
+            try:
+                shm = SharedMemory(name=name, create=False)
+                shm.close()
+                shm.unlink()
+                print(f"[server] Cleaned up shared memory: {name}")
+            except FileNotFoundError:
+                pass
+    except Exception:
+        pass
+
+
+# ============================================================
 # CLI entry point
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="nanovllm OpenAI-compatible API server")
-    parser.add_argument("--model", type=str, required=True, help="Path to model directory")
-    parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to bind (default: 0.0.0.0)")
-    parser.add_argument("--port", type=int, default=8000, help="Port to bind (default: 8000)")
-    parser.add_argument("--tensor-parallel-size", type=int, default=1, help="Tensor parallel size")
-    parser.add_argument("--max-model-len", type=int, default=4096, help="Maximum model context length")
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9, help="GPU memory utilization")
-    parser.add_argument("--enforce-eager", action="store_true", help="Disable CUDA graphs")
+    parser = argparse.ArgumentParser(
+        description="nanovllm OpenAI-compatible API server",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    # --- Required ---
+    parser.add_argument("--model", type=str, required=True,
+                        help="Path to model directory")
+
+    # --- Server options ---
+    parser.add_argument("--host", type=str, default="0.0.0.0",
+                        help="Host to bind")
+    parser.add_argument("--port", type=int, default=8000,
+                        help="Port to bind")
+
+    # --- Config parameters (matching nanovllm.config.Config dataclass) ---
+    parser.add_argument("--max-num-batched-tokens", type=int, default=16384,
+                        help="Maximum number of batched tokens per iteration")
+    parser.add_argument("--max-num-seqs", type=int, default=512,
+                        help="Maximum number of sequences per iteration")
+    parser.add_argument("--max-model-len", type=int, default=4096,
+                        help="Maximum model context length")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9,
+                        help="Fraction of GPU memory to use (0.0 ~ 1.0)")
+    parser.add_argument("--tensor-parallel-size", type=int, default=1,
+                        help="Tensor parallel size (number of GPUs)")
+    parser.add_argument("--enforce-eager", action="store_true",
+                        help="Disable CUDA graphs, use eager mode only")
+    parser.add_argument("--kvcache-block-size", type=int, default=256,
+                        help="KV cache block size (must be multiple of 256)")
+
     args = parser.parse_args()
 
     print(f"Starting nanovllm API server...")
-    print(f"  Model: {args.model}")
-    print(f"  Host:  {args.host}:{args.port}")
-    print(f"  TP:    {args.tensor_parallel_size}")
+    print(f"  Model:              {args.model}")
+    print(f"  Host:               {args.host}:{args.port}")
+    print(f"  TP size:            {args.tensor_parallel_size}")
+    print(f"  Max model len:      {args.max_model_len}")
+    print(f"  Max num seqs:       {args.max_num_seqs}")
+    print(f"  Max batched tokens: {args.max_num_batched_tokens}")
+    print(f"  GPU mem util:       {args.gpu_memory_utilization}")
+    print(f"  KV block size:      {args.kvcache_block_size}")
+    print(f"  Enforce eager:      {args.enforce_eager}")
 
+    # Build engine kwargs from all Config-compatible parameters
     engine_kwargs = {
-        "tensor_parallel_size": args.tensor_parallel_size,
+        "max_num_batched_tokens": args.max_num_batched_tokens,
+        "max_num_seqs": args.max_num_seqs,
         "max_model_len": args.max_model_len,
         "gpu_memory_utilization": args.gpu_memory_utilization,
+        "tensor_parallel_size": args.tensor_parallel_size,
         "enforce_eager": args.enforce_eager,
+        "kvcache_block_size": args.kvcache_block_size,
     }
 
     engine = AsyncEngineWrapper(args.model, **engine_kwargs)
-    app = create_app(engine)
 
-    print(f"Server ready at http://{args.host}:{args.port}")
+    # Shutdown event for coordinated cleanup
+    shutdown_event = asyncio.Event()
+    app = create_app(engine, shutdown_event)
+
+    print(f"\nServer ready at http://{args.host}:{args.port}")
     print(f"  POST /v1/chat/completions")
     print(f"  POST /v1/completions")
     print(f"  GET  /v1/models")
     print(f"  GET  /health")
+    print(f"  POST /shutdown        (graceful shutdown)")
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    # --- Custom uvicorn server with graceful shutdown ---
+    server_config = uvicorn.Config(
+        app, host=args.host, port=args.port, log_level="info",
+    )
+    server = uvicorn.Server(server_config)
+
+    # Set up signal handlers for thorough cleanup
+    original_sigint = signal.getsignal(signal.SIGINT)
+    original_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def _signal_handler(signum, frame):
+        sig_name = signal.Signals(signum).name
+        print(f"\n[server] Received {sig_name}, initiating graceful shutdown...")
+        shutdown_event.set()
+        server.should_exit = True
+
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
+    # Run server in a thread so we can monitor the shutdown event
+    server_thread = threading.Thread(target=server.run, daemon=False)
+    server_thread.start()
+
+    try:
+        # Wait for shutdown signal (from signal handler or /shutdown endpoint)
+        while not shutdown_event.is_set() and server_thread.is_alive():
+            server_thread.join(timeout=1.0)
+    except KeyboardInterrupt:
+        print("\n[server] KeyboardInterrupt, shutting down...")
+        shutdown_event.set()
+        server.should_exit = True
+
+    # --- Thorough cleanup ---
+    print("[server] Cleaning up resources...")
+
+    # 1. Stop accepting new requests and shut down uvicorn
+    server.should_exit = True
+    server_thread.join(timeout=10)
+
+    # 2. Shut down the engine (model_runner, child processes, dist, shm)
+    engine.shutdown()
+
+    # 3. Clean up any leaked shared memory
+    _cleanup_shared_memory()
+
+    # 4. Kill any remaining child processes
+    _kill_child_processes()
+
+    # 5. Final GPU cleanup
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            for i in range(torch.cuda.device_count()):
+                with torch.cuda.device(i):
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+    except Exception:
+        pass
+
+    # 6. Force garbage collection
+    gc.collect()
+
+    print("[server] All resources cleaned up. Exiting.")
+    sys.exit(0)
 
 
 if __name__ == "__main__":
