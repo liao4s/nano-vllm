@@ -18,6 +18,9 @@ def get_model_class(hf_config):
     if model_type == 'qwen3_5_moe':
         from nanovllm.models.qwen3_5 import Qwen3_5ForCausalLM
         return Qwen3_5ForCausalLM
+    elif model_type == 'qwen3_5':
+        from nanovllm.models.qwen3_5_dense import Qwen3_5DenseForCausalLM
+        return Qwen3_5DenseForCausalLM
     else:
         from nanovllm.models.qwen3 import Qwen3ForCausalLM
         return Qwen3ForCausalLM
@@ -33,7 +36,7 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
-        self._has_linear_attn = getattr(hf_config, 'model_type', '') == 'qwen3_5_moe'
+        self._has_linear_attn = getattr(hf_config, 'model_type', '') in ('qwen3_5_moe', 'qwen3_5')
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)

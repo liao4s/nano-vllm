@@ -4,6 +4,74 @@ from dataclasses import dataclass
 from transformers import AutoConfig
 
 
+class Qwen3_5DenseTextConfig:
+    """Config for Qwen3.5 Dense text model (hybrid attention + dense MLP)."""
+
+    def __init__(self, config_dict):
+        text_config = config_dict.get('text_config', config_dict)
+        self.hidden_size = text_config['hidden_size']
+        self.num_hidden_layers = text_config['num_hidden_layers']
+        self.num_attention_heads = text_config['num_attention_heads']
+        self.num_key_value_heads = text_config['num_key_value_heads']
+        self.head_dim = text_config.get('head_dim', self.hidden_size // self.num_attention_heads)
+        self.hidden_act = text_config['hidden_act']
+        self.intermediate_size = text_config['intermediate_size']
+        self.max_position_embeddings = text_config['max_position_embeddings']
+        self.rms_norm_eps = text_config['rms_norm_eps']
+        self.vocab_size = text_config['vocab_size']
+        self.layer_types = text_config['layer_types']
+
+        # Linear attention params
+        self.linear_num_key_heads = text_config['linear_num_key_heads']
+        self.linear_num_value_heads = text_config['linear_num_value_heads']
+        self.linear_key_head_dim = text_config['linear_key_head_dim']
+        self.linear_value_head_dim = text_config['linear_value_head_dim']
+        self.linear_conv_kernel_dim = text_config['linear_conv_kernel_dim']
+
+        # RoPE params
+        self.rope_parameters = text_config.get('rope_parameters', {})
+
+        # dtype
+        dtype_str = text_config.get('dtype', 'bfloat16')
+        import torch
+        self.torch_dtype = getattr(torch, dtype_str, torch.bfloat16)
+
+
+class Qwen3_5DenseConfig:
+    """Top-level config for Qwen3.5 Dense model."""
+
+    def __init__(self, config_path):
+        config_file = None
+        if os.path.isdir(config_path):
+            for name in ['config.json']:
+                candidate = os.path.join(config_path, name)
+                if os.path.isfile(candidate):
+                    config_file = candidate
+                    break
+        elif os.path.isfile(config_path):
+            config_file = config_path
+
+        if config_file is None:
+            raise FileNotFoundError(f"No config file found in {config_path}")
+
+        with open(config_file, 'r') as f:
+            config_dict = json.load(f)
+
+        self.model_type = config_dict.get('model_type', 'qwen3_5')
+        self.tie_word_embeddings = config_dict.get('tie_word_embeddings', False)
+        self.text_config = Qwen3_5DenseTextConfig(config_dict)
+
+        # Expose text_config attributes at top level for compatibility
+        self.hidden_size = self.text_config.hidden_size
+        self.num_hidden_layers = self.text_config.num_hidden_layers
+        self.num_attention_heads = self.text_config.num_attention_heads
+        self.num_key_value_heads = self.text_config.num_key_value_heads
+        self.head_dim = self.text_config.head_dim
+        self.max_position_embeddings = self.text_config.max_position_embeddings
+        self.vocab_size = self.text_config.vocab_size
+        self.torch_dtype = self.text_config.torch_dtype
+
+
 class Qwen3_5MoeTextConfig:
     """Config for Qwen3.5 MoE text model, loaded from local config file."""
 
@@ -101,6 +169,8 @@ def load_hf_config(model_path):
         model_type = config_dict.get('model_type', '')
         if model_type == 'qwen3_5_moe':
             return Qwen3_5MoeConfig(model_path)
+        if model_type == 'qwen3_5':
+            return Qwen3_5DenseConfig(model_path)
 
     # Default: use transformers AutoConfig
     return AutoConfig.from_pretrained(model_path)
