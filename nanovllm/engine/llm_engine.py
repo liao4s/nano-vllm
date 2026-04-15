@@ -43,6 +43,8 @@ class LLMEngine:
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
+        # Allocate linear attention buffer slot for this sequence
+        self.model_runner.call("allocate_linear_attn_slot", seq.seq_id)
         self.scheduler.add(seq)
 
     def step(self):
@@ -50,6 +52,10 @@ class LLMEngine:
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        # Free linear attention buffer slots for finished sequences
+        for seq in seqs:
+            if seq.is_finished:
+                self.model_runner.call("free_linear_attn_slot", seq.seq_id)
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
         return outputs, num_tokens
 

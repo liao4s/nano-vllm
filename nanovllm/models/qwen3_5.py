@@ -220,9 +220,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     """
     Gated DeltaNet linear attention layer.
 
-    Maintains per-sequence recurrent state and conv state across decode steps.
-    During prefill: processes each sequence independently, saves final states.
-    During decode: uses saved states for autoregressive generation.
+    Maintains per-sequence recurrent state and conv state in pre-allocated GPU buffers
+    for CUDA Graph compatibility. During decode, all sequences are processed in a single
+    batched operation with no Python control flow.
+
+    During prefill: processes each sequence independently, writes final states to buffer.
+    During decode: reads/writes pre-allocated buffers via slot indices (CUDA Graph safe).
     """
 
     def __init__(
@@ -271,23 +274,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.norm = RMSNormGated(self.head_v_dim, eps=rms_norm_eps)
         self.out_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
 
-        # Per-sequence recurrent state cache: seq_id -> (recurrent_state, conv_state)
-        # recurrent_state: [1, num_v_heads, head_k_dim, head_v_dim]
-        # conv_state: [1, conv_dim, conv_kernel_size - 1]
-        self._recurrent_states: dict[int, torch.Tensor] = {}
-        self._conv_states: dict[int, torch.Tensor] = {}
-
-    def clear_state(self, seq_id: int):
-        """Remove cached state for a finished sequence."""
-        self._recurrent_states.pop(seq_id, None)
-        self._conv_states.pop(seq_id, None)
+        # Pre-allocated state buffers (set by model_runner.allocate_linear_attn_states)
+        # recurrent_state_buf: [max_num_seqs, num_v_heads, head_k_dim, head_v_dim] float32
+        # conv_state_buf: [max_num_seqs, conv_dim, kernel_size - 1] model_dtype
+        self.recurrent_state_buf: torch.Tensor | None = None
+        self.conv_state_buf: torch.Tensor | None = None
 
     def _forward_prefill(
         self,
         hidden_states: torch.Tensor,
-        seq_id: int | None = None,
+        slot_idx: int | None = None,
     ) -> torch.Tensor:
-        """Process a full sequence during prefill. Save final state if seq_id provided."""
+        """Process a full sequence during prefill. Write final state to buffer slot if provided."""
         seq_len = hidden_states.shape[0]
         batch_size = 1
         hidden_states_3d = hidden_states.unsqueeze(0)  # [1, seq_len, hidden_size]
@@ -302,9 +300,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         b = self.in_proj_b(hidden_states_3d)
         a = self.in_proj_a(hidden_states_3d)
 
-        # Save conv state for decode: last (kernel_size - 1) columns of pre-activation mixed_qkv
-        if seq_id is not None:
-            self._conv_states[seq_id] = mixed_qkv[:, :, -(self.conv_kernel_size - 1):].clone()
+        # Save conv state to buffer: last (kernel_size - 1) columns of pre-activation mixed_qkv
+        if slot_idx is not None and self.conv_state_buf is not None:
+            self.conv_state_buf[slot_idx].copy_(
+                mixed_qkv[0, :, -(self.conv_kernel_size - 1):]
+            )
 
         # Causal conv1d + SiLU activation
         mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
@@ -326,16 +326,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
         # Chunk-based gated delta rule — output final state for decode
+        save_state = (slot_idx is not None and self.recurrent_state_buf is not None)
         core_attn_out, last_recurrent_state = torch_chunk_gated_delta_rule(
             query, key, value,
             g=g, beta=beta,
             initial_state=None,
-            output_final_state=(seq_id is not None),
+            output_final_state=save_state,
             use_qk_l2norm_in_kernel=True,
         )
 
-        if seq_id is not None and last_recurrent_state is not None:
-            self._recurrent_states[seq_id] = last_recurrent_state
+        if save_state and last_recurrent_state is not None:
+            self.recurrent_state_buf[slot_idx].copy_(last_recurrent_state.squeeze(0))
 
         # Apply gated RMSNorm
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
@@ -346,73 +347,88 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         output = self.out_proj(core_attn_out)
         return output.squeeze(0)
 
-    def _forward_decode_one(
+    def _forward_decode_batched(
         self,
         hidden_states: torch.Tensor,
-        seq_id: int,
+        slot_indices: torch.Tensor,
     ) -> torch.Tensor:
-        """Process a single token during decode using cached state."""
-        batch_size = 1
-        hidden_states_3d = hidden_states.unsqueeze(0).unsqueeze(0)  # [1, 1, hidden_size]
+        """
+        Batched decode: process all tokens simultaneously.
+        All tensor ops, no Python control flow → CUDA Graph compatible.
 
-        mixed_qkv = self.in_proj_qkv(hidden_states_3d)  # [1, 1, conv_dim]
-        mixed_qkv = mixed_qkv.transpose(1, 2)  # [1, conv_dim, 1]
+        hidden_states: [B, hidden_size]
+        slot_indices: [B] int tensor mapping batch position to buffer slot
+        """
+        B = hidden_states.shape[0]
 
-        z = self.in_proj_z(hidden_states_3d)
-        z = z.reshape(batch_size, 1, -1, self.head_v_dim)
+        # 1. Linear projections (batched)
+        mixed_qkv = self.in_proj_qkv(hidden_states)   # [B, conv_dim]
+        z = self.in_proj_z(hidden_states)               # [B, value_dim]
+        a = self.in_proj_a(hidden_states)               # [B, num_v_heads]
+        b = self.in_proj_b(hidden_states)               # [B, num_v_heads]
 
-        b = self.in_proj_b(hidden_states_3d)
-        a = self.in_proj_a(hidden_states_3d)
+        # 2. Conv1d with pre-allocated state buffer
+        mixed_qkv_col = mixed_qkv.unsqueeze(-1)                     # [B, conv_dim, 1]
+        conv_state = self.conv_state_buf[slot_indices]                # [B, conv_dim, kernel_size-1]
+        conv_input = torch.cat([conv_state, mixed_qkv_col], dim=-1)  # [B, conv_dim, kernel_size]
+        # Update conv state buffer: sliding window (drop oldest, keep newest kernel_size-1)
+        self.conv_state_buf[slot_indices] = conv_input[:, :, 1:]
+        # Depthwise conv + activation
+        mixed_qkv_act = F.silu(
+            F.conv1d(conv_input, self.conv1d.weight, bias=None, padding=0, groups=self.conv_dim)
+        )  # [B, conv_dim, 1]
+        mixed_qkv_act = mixed_qkv_act.squeeze(-1)  # [B, conv_dim]
 
-        # Conv1d with cached state
-        conv_state = self._conv_states.get(seq_id)
-        if conv_state is not None:
-            conv_input = torch.cat([conv_state, mixed_qkv], dim=-1)  # [1, conv_dim, kernel_size]
-        else:
-            conv_input = F.pad(mixed_qkv, (self.conv_kernel_size - 1, 0))
-        # Update conv state: last (kernel_size - 1) columns
-        self._conv_states[seq_id] = conv_input[:, :, -(self.conv_kernel_size - 1):].clone()
-
-        # Apply depthwise conv (manual, since we have the full window)
-        mixed_qkv_conv = F.conv1d(
-            conv_input, self.conv1d.weight, self.conv1d.bias,
-            padding=0, groups=self.conv_dim
+        # 3. Split Q, K, V and reshape
+        query, key, value = mixed_qkv_act.split(
+            [self.key_dim, self.key_dim, self.value_dim], dim=-1,
         )
-        mixed_qkv = F.silu(mixed_qkv_conv)  # [1, conv_dim, 1]
-        mixed_qkv = mixed_qkv.transpose(1, 2)  # [1, 1, conv_dim]
+        query = query.view(B, self.num_k_heads, self.head_k_dim)
+        key = key.view(B, self.num_k_heads, self.head_k_dim)
+        value = value.view(B, self.num_v_heads, self.head_v_dim)
 
-        query, key, value = torch.split(
-            mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1,
-        )
-        query = query.reshape(batch_size, 1, -1, self.head_k_dim)
-        key = key.reshape(batch_size, 1, -1, self.head_k_dim)
-        value = value.reshape(batch_size, 1, -1, self.head_v_dim)
+        # L2 norm on Q, K
+        query = l2norm(query, dim=-1)
+        key = l2norm(key, dim=-1)
 
-        beta = b.sigmoid()
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-
+        # GQA expand k_heads → v_heads if needed
         if self.num_v_heads // self.num_k_heads > 1:
-            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+            ratio = self.num_v_heads // self.num_k_heads
+            query = query.repeat_interleave(ratio, dim=1)
+            key = key.repeat_interleave(ratio, dim=1)
 
-        # Recurrent gated delta rule (single step)
-        recurrent_state = self._recurrent_states.get(seq_id)
-        core_attn_out, last_recurrent_state = torch_recurrent_gated_delta_rule(
-            query, key, value,
-            g=g, beta=beta,
-            initial_state=recurrent_state,
-            output_final_state=True,
-            use_qk_l2norm_in_kernel=True,
-        )
-        self._recurrent_states[seq_id] = last_recurrent_state
+        # 4. Single-step recurrent delta rule (batched, float32)
+        scale = self.head_k_dim ** -0.5
+        q = query.float() * scale                   # [B, H, Dk]
+        k = key.float()                              # [B, H, Dk]
+        v = value.float()                            # [B, H, Dv]
+        beta_val = b.sigmoid().float()               # [B, H]
+        g_val = (-self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)).exp()  # [B, H]
 
-        core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
-        z = z.reshape(-1, self.head_v_dim)
-        core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(batch_size, 1, -1)
+        # Read state from buffer
+        state = self.recurrent_state_buf[slot_indices].float()  # [B, H, Dk, Dv]
 
-        output = self.out_proj(core_attn_out)
-        return output.squeeze(0).squeeze(0)  # [hidden_size]
+        # Decay: state *= g
+        state = state * g_val.unsqueeze(-1).unsqueeze(-1)       # [B, H, Dk, Dv]
+        # Recall: kv_mem = (state * k).sum(Dk)
+        kv_mem = (state * k.unsqueeze(-1)).sum(dim=-2)           # [B, H, Dv]
+        # Delta update: delta = (v - kv_mem) * beta
+        delta = (v - kv_mem) * beta_val.unsqueeze(-1)            # [B, H, Dv]
+        # Write: state += outer(k, delta)
+        state = state + k.unsqueeze(-1) * delta.unsqueeze(-2)    # [B, H, Dk, Dv]
+        # Query: output = (state * q).sum(Dk)
+        output = (state * q.unsqueeze(-1)).sum(dim=-2)           # [B, H, Dv]
+
+        # Write state back to buffer (cast float32 → buffer dtype)
+        self.recurrent_state_buf[slot_indices] = state.to(self.recurrent_state_buf.dtype)
+
+        # 5. RMSNorm + gate + output projection
+        output = output.to(hidden_states.dtype)
+        output = output.reshape(B * self.num_v_heads, self.head_v_dim)
+        z_flat = z.reshape(B * self.num_v_heads, self.head_v_dim)
+        output = self.norm(output, z_flat)
+        output = output.view(B, self.value_dim)
+        return self.out_proj(output)
 
     def forward(
         self,
@@ -421,8 +437,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         """
         Process hidden_states of shape [total_tokens, hidden_size].
 
-        Prefill: each sequence is processed independently, recurrent state is saved.
-        Decode: each token uses its sequence's saved recurrent state.
+        Prefill: each sequence processed independently, state saved to buffer slots.
+        Decode: batched processing via pre-allocated buffers (CUDA Graph compatible).
         """
         from nanovllm.utils.context import get_context
         context = get_context()
@@ -435,19 +451,25 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 start = cu_seqlens[i].item()
                 end = cu_seqlens[i + 1].item()
                 seq_hidden = hidden_states[start:end]
-                # Use sequence index as ID during prefill
-                seq_out = self._forward_prefill(seq_hidden, seq_id=i)
+                # Get buffer slot index for this sequence
+                if (context.linear_attn_slot_indices is not None
+                        and self.recurrent_state_buf is not None):
+                    slot_idx = context.linear_attn_slot_indices[i].item()
+                else:
+                    slot_idx = None
+                seq_out = self._forward_prefill(seq_hidden, slot_idx=slot_idx)
                 outputs.append(seq_out)
             return torch.cat(outputs, dim=0)
         else:
-            # Decode: process each token with its sequence's state
-            num_tokens = hidden_states.shape[0]
-            outputs = []
-            for i in range(num_tokens):
-                token_hidden = hidden_states[i]
-                out = self._forward_decode_one(token_hidden, seq_id=i)
-                outputs.append(out)
-            return torch.stack(outputs, dim=0)
+            # Decode: batched processing with buffer slot indices
+            if (context.linear_attn_slot_indices is not None
+                    and self.recurrent_state_buf is not None):
+                return self._forward_decode_batched(
+                    hidden_states, context.linear_attn_slot_indices
+                )
+            else:
+                # Fallback for warmup (no buffer allocated yet)
+                return torch.zeros_like(hidden_states)
 
 
 # ============================================================
@@ -661,6 +683,21 @@ class Qwen3_5Experts(nn.Module):
         top_k_indices: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
+        from nanovllm.utils.context import get_context
+        context = get_context()
+        if context.is_prefill:
+            return self._forward_sparse(hidden_states, top_k_indices, top_k_weights)
+        else:
+            return self._forward_dense(hidden_states, top_k_indices, top_k_weights)
+
+    def _forward_sparse(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_indices: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sparse dispatch — used for prefill (not in CUDA Graph).
+        Uses nonzero/where to only compute active expert-token pairs."""
         final_hidden_states = torch.zeros_like(hidden_states)
         with torch.no_grad():
             expert_mask = F.one_hot(top_k_indices, num_classes=self.num_experts)
@@ -680,6 +717,42 @@ class Qwen3_5Experts(nn.Module):
             final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
 
         return final_hidden_states
+
+    def _forward_dense(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_indices: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Dense gather-based dispatch — CUDA Graph compatible for decode.
+        Iterates over top_k slots (fixed count), gathers per-token expert weights,
+        and uses batched matmul. All tensor shapes are fixed regardless of routing."""
+        final = torch.zeros_like(hidden_states)
+        top_k = top_k_indices.shape[1]
+
+        for k in range(top_k):
+            idx = top_k_indices[:, k]           # [N] expert index per token
+            w = top_k_weights[:, k:k+1]         # [N, 1] routing weight
+
+            # Gather expert parameters for each token's selected expert
+            # gate_up_proj: [num_experts, 2*inter, hidden] -> [N, 2*inter, hidden]
+            # down_proj:    [num_experts, hidden, inter]   -> [N, hidden, inter]
+            gate_up_w = self.gate_up_proj[idx]
+            down_w = self.down_proj[idx]
+
+            # Batched matmul: gate_up projection
+            # [N, 2*inter, hidden] @ [N, hidden, 1] -> [N, 2*inter]
+            x = torch.bmm(gate_up_w, hidden_states.unsqueeze(-1)).squeeze(-1)
+            gate, up = x.chunk(2, dim=-1)
+            x = F.silu(gate) * up               # [N, inter]
+
+            # Batched matmul: down projection
+            # [N, hidden, inter] @ [N, inter, 1] -> [N, hidden]
+            x = torch.bmm(down_w, x.unsqueeze(-1)).squeeze(-1)
+
+            final = final + w * x
+
+        return final
 
 
 # ============================================================

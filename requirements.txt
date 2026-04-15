@@ -1,0 +1,12 @@
+torch>=2.1.0
+transformers>=4.40.0
+safetensors>=0.4.0
+flash-attn>=2.5.0
+triton>=2.2.0
+tqdm
+xxhash
+numpy
+fastapi>=0.100.0
+uvicorn>=0.20.0
+requests
+pydantic>=2.0.0

@@ -222,12 +222,21 @@ class AsyncEngineWrapper:
             try:
                 outputs, _ = self.engine.step()
             except Exception as e:
+                # Log the error for debugging
+                import traceback
+                print(f"[engine_loop] ERROR in step(): {e}")
+                traceback.print_exc()
                 # Resolve all pending futures with the error
                 with self._lock:
                     for pending in self._pending.values():
                         if not pending.future.done():
                             pending.loop.call_soon_threadsafe(
                                 pending.future.set_exception, e
+                            )
+                        # Also send sentinel to streaming queues to unblock clients
+                        if pending.stream and pending.token_queue is not None:
+                            pending.loop.call_soon_threadsafe(
+                                pending.token_queue.put_nowait, None
                             )
                     self._pending.clear()
                     self._seq_prev_tokens.clear()
