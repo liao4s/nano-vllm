@@ -18,6 +18,7 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        self.config = config
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
@@ -42,6 +43,21 @@ class LLMEngine:
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
+        max_model_len = self.config.max_model_len
+        num_prompt_tokens = len(prompt)
+        if num_prompt_tokens > max_model_len:
+            raise ValueError(
+                f"Prompt too long: {num_prompt_tokens} tokens exceeds "
+                f"max_model_len={max_model_len}. Please reduce the prompt length."
+            )
+        # Clamp max_tokens so prompt + completion never exceeds max_model_len
+        max_allowed_new_tokens = max_model_len - num_prompt_tokens
+        if sampling_params.max_tokens > max_allowed_new_tokens:
+            sampling_params = SamplingParams(
+                temperature=sampling_params.temperature,
+                max_tokens=max(max_allowed_new_tokens, 1),
+                ignore_eos=sampling_params.ignore_eos,
+            )
         seq = Sequence(prompt, sampling_params)
         # Allocate linear attention buffer slot for this sequence
         self.model_runner.call("allocate_linear_attn_slot", seq.seq_id)

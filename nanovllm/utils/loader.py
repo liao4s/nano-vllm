@@ -4,6 +4,10 @@ import torch
 from torch import nn
 from safetensors import safe_open
 
+from nanovllm.utils.logger import init_logger
+
+logger = init_logger(__name__)
+
 
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
     param.data.copy_(loaded_weight)
@@ -48,10 +52,10 @@ def load_model(model: nn.Module, path: str):
                         param = model.get_parameter(param_name)
                     except (AttributeError, KeyError):
                         # Parameter not found in model, skip
-                        print(f"[loader] WARNING: skipped weight '{weight_name}' (no matching param '{param_name}')")
+                        logger.warning("Skipped weight '%s' (no matching param '%s')", weight_name, param_name)
                         skipped_count += 1
                         continue
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, f.get_tensor(weight_name))
                     loaded_count += 1
-    print(f"[loader] Loaded {loaded_count} weights, skipped {skipped_count}")
+    logger.info("Loaded %d weights, skipped %d", loaded_count, skipped_count)

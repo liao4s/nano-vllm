@@ -33,6 +33,9 @@ from pydantic import BaseModel, Field
 
 from nanovllm.engine.llm_engine import LLMEngine
 from nanovllm.sampling_params import SamplingParams
+from nanovllm.utils.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 # ============================================================
@@ -167,7 +170,7 @@ class AsyncEngineWrapper:
 
     def shutdown(self):
         """Thoroughly clean up all engine resources, child processes, and GPU memory."""
-        print("[server] Shutting down engine...")
+        logger.info("Shutting down engine...")
         self._running = False
         self._has_work.set()  # Wake up the engine loop so it can exit
 
@@ -175,7 +178,7 @@ class AsyncEngineWrapper:
         if self._thread.is_alive():
             self._thread.join(timeout=15)
             if self._thread.is_alive():
-                print("[server] WARNING: Engine loop thread did not exit cleanly")
+                logger.warning("Engine loop thread did not exit cleanly")
 
         # Resolve any remaining pending futures with cancellation
         with self._lock:
@@ -198,7 +201,7 @@ class AsyncEngineWrapper:
         try:
             self.engine.exit()
         except Exception as e:
-            print(f"[server] WARNING: Error during engine exit: {e}")
+            logger.warning("Error during engine exit: %s", e)
 
         # Release references to allow GC
         del self.engine
@@ -215,7 +218,7 @@ class AsyncEngineWrapper:
 
         # Force garbage collection
         gc.collect()
-        print("[server] Engine shutdown complete.")
+        logger.info("Engine shutdown complete.")
 
     def add_request(
         self,
@@ -223,7 +226,10 @@ class AsyncEngineWrapper:
         sampling_params: SamplingParams,
         stream: bool = False,
     ) -> PendingRequest:
-        """Add a request to the engine. Returns a PendingRequest with future/queue."""
+        """Add a request to the engine. Returns a PendingRequest with future/queue.
+
+        Raises ValueError if the prompt exceeds max_model_len.
+        """
         loop = asyncio.get_event_loop()
         future = loop.create_future()
         request_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
@@ -233,6 +239,16 @@ class AsyncEngineWrapper:
             prompt_ids = self.tokenizer.encode(prompt)
         else:
             prompt_ids = prompt
+
+        # Pre-check prompt length before touching the engine.
+        # LLMEngine.add_request() also validates, but checking here gives
+        # the server layer a chance to return HTTP 400 instead of crashing.
+        max_model_len = self.engine.config.max_model_len
+        if len(prompt_ids) > max_model_len:
+            raise ValueError(
+                f"Prompt too long: {len(prompt_ids)} tokens exceeds "
+                f"max_model_len={max_model_len}. Please reduce the prompt length."
+            )
 
         # Add to engine (creates Sequence internally)
         self.engine.add_request(prompt_ids, sampling_params)
@@ -276,7 +292,7 @@ class AsyncEngineWrapper:
             except Exception as e:
                 # Log the error for debugging
                 import traceback
-                print(f"[engine_loop] ERROR in step(): {e}")
+                logger.error("Error in engine step(): %s", e)
                 traceback.print_exc()
                 # Resolve all pending futures with the error
                 with self._lock:
@@ -411,7 +427,10 @@ def create_app(engine: AsyncEngineWrapper, shutdown_event: asyncio.Event | None 
             max_tokens=request.max_tokens,
         )
 
-        pending = engine.add_request(prompt, sampling_params, stream=request.stream)
+        try:
+            pending = engine.add_request(prompt, sampling_params, stream=request.stream)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
         if request.stream:
             return StreamingResponse(
@@ -507,7 +526,10 @@ def create_app(engine: AsyncEngineWrapper, shutdown_event: asyncio.Event | None 
             max_tokens=request.max_tokens,
         )
 
-        pending = engine.add_request(prompt, sampling_params, stream=request.stream)
+        try:
+            pending = engine.add_request(prompt, sampling_params, stream=request.stream)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
         if request.stream:
             return StreamingResponse(
@@ -583,11 +605,11 @@ def _kill_child_processes():
         parent = psutil.Process(current)
         children = parent.children(recursive=True)
         for child in children:
-            print(f"[server] Terminating child process PID={child.pid}")
+            logger.info("Terminating child process PID=%d", child.pid)
             child.terminate()
         gone, alive = psutil.wait_procs(children, timeout=5)
         for p in alive:
-            print(f"[server] Force killing child process PID={p.pid}")
+            logger.warning("Force killing child process PID=%d", p.pid)
             p.kill()
     except ImportError:
         # psutil not available, use os-level signal
@@ -607,7 +629,7 @@ def _cleanup_shared_memory():
                 shm = SharedMemory(name=name, create=False)
                 shm.close()
                 shm.unlink()
-                print(f"[server] Cleaned up shared memory: {name}")
+                logger.info("Cleaned up shared memory: %s", name)
             except FileNotFoundError:
                 pass
     except Exception:
@@ -637,7 +659,7 @@ def main():
     # --- Config parameters (matching nanovllm.config.Config dataclass) ---
     parser.add_argument("--max-num-batched-tokens", type=int, default=16384,
                         help="Maximum number of batched tokens per iteration")
-    parser.add_argument("--max-num-seqs", type=int, default=512,
+    parser.add_argument("--max-num-seqs", type=int, default=32,
                         help="Maximum number of sequences per iteration")
     parser.add_argument("--max-model-len", type=int, default=4096,
                         help="Maximum model context length")
@@ -649,22 +671,27 @@ def main():
                         help="Disable CUDA graphs, use eager mode only")
     parser.add_argument("--kvcache-block-size", type=int, default=256,
                         help="KV cache block size (must be multiple of 256)")
+    parser.add_argument("--enable-prefix-caching", action="store_true", default=True,
+                        help="Enable prefix caching (default: enabled)")
+    parser.add_argument("--no-prefix-caching", dest="enable_prefix_caching", action="store_false",
+                        help="Disable prefix caching")
     parser.add_argument("--served-model-name", type=str, default=None,
                         help="Custom model name for API responses. If not set, uses the model directory name")
 
     args = parser.parse_args()
 
-    print(f"Starting nanovllm API server...")
-    print(f"  Model:              {args.model}")
-    print(f"  Host:               {args.host}:{args.port}")
-    print(f"  TP size:            {args.tensor_parallel_size}")
-    print(f"  Max model len:      {args.max_model_len}")
-    print(f"  Max num seqs:       {args.max_num_seqs}")
-    print(f"  Max batched tokens: {args.max_num_batched_tokens}")
-    print(f"  GPU mem util:       {args.gpu_memory_utilization}")
-    print(f"  KV block size:      {args.kvcache_block_size}")
-    print(f"  Enforce eager:      {args.enforce_eager}")
-    print(f"  Served model name:  {args.served_model_name or '(auto)'}")
+    logger.info("Starting nanovllm API server...")
+    logger.info("  Model:              %s", args.model)
+    logger.info("  Host:               %s:%d", args.host, args.port)
+    logger.info("  TP size:            %d", args.tensor_parallel_size)
+    logger.info("  Max model len:      %d", args.max_model_len)
+    logger.info("  Max num seqs:       %d", args.max_num_seqs)
+    logger.info("  Max batched tokens: %d", args.max_num_batched_tokens)
+    logger.info("  GPU mem util:       %.2f", args.gpu_memory_utilization)
+    logger.info("  KV block size:      %d", args.kvcache_block_size)
+    logger.info("  Enforce eager:      %s", args.enforce_eager)
+    logger.info("  Prefix caching:     %s", args.enable_prefix_caching)
+    logger.info("  Served model name:  %s", args.served_model_name or "(auto)")
 
     # Build engine kwargs from all Config-compatible parameters
     engine_kwargs = {
@@ -675,6 +702,7 @@ def main():
         "tensor_parallel_size": args.tensor_parallel_size,
         "enforce_eager": args.enforce_eager,
         "kvcache_block_size": args.kvcache_block_size,
+        "enable_prefix_caching": args.enable_prefix_caching,
     }
 
     engine = AsyncEngineWrapper(args.model, served_model_name=args.served_model_name, **engine_kwargs)
@@ -683,12 +711,12 @@ def main():
     shutdown_event = asyncio.Event()
     app = create_app(engine, shutdown_event)
 
-    print(f"\nServer ready at http://{args.host}:{args.port}")
-    print(f"  POST /v1/chat/completions")
-    print(f"  POST /v1/completions")
-    print(f"  GET  /v1/models")
-    print(f"  GET  /health")
-    print(f"  POST /shutdown        (graceful shutdown)")
+    logger.info("Server ready at http://%s:%d", args.host, args.port)
+    logger.info("  POST /v1/chat/completions")
+    logger.info("  POST /v1/completions")
+    logger.info("  GET  /v1/models")
+    logger.info("  GET  /health")
+    logger.info("  POST /shutdown        (graceful shutdown)")
 
     # --- Custom uvicorn server with graceful shutdown ---
     server_config = uvicorn.Config(
@@ -702,7 +730,7 @@ def main():
 
     def _signal_handler(signum, frame):
         sig_name = signal.Signals(signum).name
-        print(f"\n[server] Received {sig_name}, initiating graceful shutdown...")
+        logger.info("Received %s, initiating graceful shutdown...", sig_name)
         shutdown_event.set()
         server.should_exit = True
 
@@ -718,12 +746,12 @@ def main():
         while not shutdown_event.is_set() and server_thread.is_alive():
             server_thread.join(timeout=1.0)
     except KeyboardInterrupt:
-        print("\n[server] KeyboardInterrupt, shutting down...")
+        logger.info("KeyboardInterrupt, shutting down...")
         shutdown_event.set()
         server.should_exit = True
 
     # --- Thorough cleanup ---
-    print("[server] Cleaning up resources...")
+    logger.info("Cleaning up resources...")
 
     # 1. Stop accepting new requests and shut down uvicorn
     server.should_exit = True
@@ -753,7 +781,7 @@ def main():
     # 6. Force garbage collection
     gc.collect()
 
-    print("[server] All resources cleaned up. Exiting.")
+    logger.info("All resources cleaned up. Exiting.")
     sys.exit(0)
 
 

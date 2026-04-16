@@ -10,6 +10,9 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+from nanovllm.utils.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 def get_model_class(hf_config):
@@ -163,8 +166,8 @@ class ModelRunner:
                 self._cuda_graph_reserve_bytes = num_total_layers * 2 * 1024 * 1024  # ~2MB per layer
         budget_mb = self._linear_attn_budget_bytes / 1024 / 1024
         graph_mb = self._cuda_graph_reserve_bytes / 1024 / 1024
-        print(f"[model_runner] Reserved memory: linear_attn={budget_mb:.0f}MB ({max_slots} slots), "
-              f"cuda_graph={graph_mb:.0f}MB")
+        logger.info("Reserved memory: linear_attn=%.0fMB (%d slots), "
+                    "cuda_graph=%.0fMB", budget_mb, max_slots, graph_mb)
 
     def allocate_kv_cache(self):
         config = self.config
@@ -239,9 +242,10 @@ class ModelRunner:
 
         recurrent_mb = self.linear_attn_recurrent_buf.numel() * elem_size / 1024 / 1024
         conv_mb = self.linear_attn_conv_buf.numel() * elem_size / 1024 / 1024
-        print(f"[model_runner] Allocated linear attention state buffers: "
-              f"recurrent={recurrent_mb:.1f}MB, conv={conv_mb:.1f}MB "
-              f"({num_layers} layers × {max_slots} slots, dtype={dtype})")
+        logger.info("Allocated linear attention state buffers: "
+                    "recurrent=%.1fMB, conv=%.1fMB "
+                    "(%d layers x %d slots, dtype=%s)",
+                    recurrent_mb, conv_mb, num_layers, max_slots, dtype)
 
     def allocate_linear_attn_slot(self, seq_id: int) -> int:
         """Allocate a buffer slot for a new sequence. Returns slot index."""
