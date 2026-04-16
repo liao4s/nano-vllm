@@ -147,10 +147,10 @@ class PendingRequest:
 class AsyncEngineWrapper:
     """Wraps LLMEngine and runs the step loop in a background thread."""
 
-    def __init__(self, model_path: str, **engine_kwargs):
+    def __init__(self, model_path: str, served_model_name: str | None = None, **engine_kwargs):
         self.engine = LLMEngine(model_path, **engine_kwargs)
         self.tokenizer = self.engine.tokenizer
-        self.model_name = model_path.rstrip("/").split("/")[-1]
+        self.model_name = served_model_name or model_path.rstrip("/").split("/")[-1]
 
         # seq_id -> PendingRequest
         self._pending: dict[int, PendingRequest] = {}
@@ -649,6 +649,8 @@ def main():
                         help="Disable CUDA graphs, use eager mode only")
     parser.add_argument("--kvcache-block-size", type=int, default=256,
                         help="KV cache block size (must be multiple of 256)")
+    parser.add_argument("--served-model-name", type=str, default=None,
+                        help="Custom model name for API responses. If not set, uses the model directory name")
 
     args = parser.parse_args()
 
@@ -662,6 +664,7 @@ def main():
     print(f"  GPU mem util:       {args.gpu_memory_utilization}")
     print(f"  KV block size:      {args.kvcache_block_size}")
     print(f"  Enforce eager:      {args.enforce_eager}")
+    print(f"  Served model name:  {args.served_model_name or '(auto)'}")
 
     # Build engine kwargs from all Config-compatible parameters
     engine_kwargs = {
@@ -674,7 +677,7 @@ def main():
         "kvcache_block_size": args.kvcache_block_size,
     }
 
-    engine = AsyncEngineWrapper(args.model, **engine_kwargs)
+    engine = AsyncEngineWrapper(args.model, served_model_name=args.served_model_name, **engine_kwargs)
 
     # Shutdown event for coordinated cleanup
     shutdown_event = asyncio.Event()
