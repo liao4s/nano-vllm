@@ -657,7 +657,7 @@ def main():
                         help="Port to bind")
 
     # --- Config parameters (matching nanovllm.config.Config dataclass) ---
-    parser.add_argument("--max-num-batched-tokens", type=int, default=16384,
+    parser.add_argument("--max-num-batched-tokens", type=int, default=200000,
                         help="Maximum number of batched tokens per iteration")
     parser.add_argument("--max-num-seqs", type=int, default=32,
                         help="Maximum number of sequences per iteration")

@@ -809,6 +809,7 @@ class Qwen3_5DecoderLayer(nn.Module):
         text_config = config.text_config if hasattr(config, 'text_config') else config
         self.hidden_size = text_config.hidden_size
         self.layer_type = text_config.layer_types[layer_idx]
+        self.layer_idx = layer_idx
 
         if self.layer_type == "linear_attention":
             self.linear_attn = Qwen3_5GatedDeltaNet(
@@ -867,18 +868,22 @@ class Qwen3_5DecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
+        torch.cuda.nvtx.range_push(f"{self.layer_type}_{self.layer_idx}")
         # Token mixing
         if self.layer_type == "linear_attention":
             hidden_states = self.linear_attn(hidden_states)
         elif self.layer_type == "full_attention":
             hidden_states = self.self_attn(positions, hidden_states)
+        torch.cuda.nvtx.range_pop()
 
         hidden_states = residual + hidden_states
 
         # MLP
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        torch.cuda.nvtx.range_push(f"{self.layer_idx}_mlp")
         hidden_states = self.mlp(hidden_states)
+        torch.cuda.nvtx.range_pop()
 
         # Return hidden_states (mlp output, not yet added to residual)
         # and residual (pre-mlp state). They'll be added at start of next layer.
