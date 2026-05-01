@@ -41,8 +41,20 @@ class ModelRunner:
         self.event = event
         self._has_linear_attn = getattr(hf_config, 'model_type', '') in ('qwen3_5_moe', 'qwen3_5')
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        import datetime
+        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank,
+                                timeout=datetime.timedelta(minutes=30))
         torch.cuda.set_device(rank)
+        # Set up Triton allocator (must be done per-process for TP)
+        try:
+            import triton
+            from triton.runtime._allocation import Allocator
+            class _TorchAllocator(Allocator):
+                def __call__(self, size, align, stream):
+                    return torch.empty(size, dtype=torch.uint8, device=torch.cuda.current_device()).data_ptr()
+            triton.set_allocator(_TorchAllocator())
+        except Exception:
+            pass
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")

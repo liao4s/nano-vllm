@@ -18,6 +18,7 @@ import torch.distributed as dist
 
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
+
 from nanovllm.layers.linear import (
     QKVParallelLinear,
     MergedColumnParallelLinear,
@@ -325,18 +326,33 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
-        # Chunk-based gated delta rule — output final state for decode
+        # Chunk-based gated delta rule (Triton kernel) — fast for long sequences
+        from nanovllm.layers.fla_ops.chunk import chunk_gated_delta_rule as triton_chunk_gated_delta_rule
         save_state = (slot_idx is not None and self.recurrent_state_buf is not None)
-        core_attn_out, last_recurrent_state = torch_chunk_gated_delta_rule(
-            query, key, value,
-            g=g, beta=beta,
-            initial_state=None,
+        
+        # Initial state: zeros [1, HV, V, K] (bfloat16 for chunk kernel)
+        initial_state = torch.zeros(
+            1, self.num_v_heads, self.head_v_dim, self.head_k_dim,
+            dtype=hidden_states.dtype, device=hidden_states.device,
+        )
+        
+        core_attn_out, last_recurrent_state = triton_chunk_gated_delta_rule(
+            q=query,         # [1, seq_len, H, K]
+            k=key,           # [1, seq_len, H, K]
+            v=value,         # [1, seq_len, HV, V]
+            g=g,             # [1, seq_len, HV] (log-space)
+            beta=beta,       # [1, seq_len, HV]
+            initial_state=initial_state,
             output_final_state=save_state,
             use_qk_l2norm_in_kernel=True,
         )
 
         if save_state and last_recurrent_state is not None:
-            self.recurrent_state_buf[slot_idx].copy_(last_recurrent_state.squeeze(0))
+            # last_recurrent_state: [1, HV, V, K] -> buf[slot_idx] is [H, K, V]
+            # Transpose V,K -> K,V to match buffer layout
+            self.recurrent_state_buf[slot_idx].copy_(
+                last_recurrent_state.squeeze(0).transpose(-1, -2).to(self.recurrent_state_buf.dtype)
+            )
 
         # Apply gated RMSNorm
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
@@ -397,30 +413,22 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             query = query.repeat_interleave(ratio, dim=1)
             key = key.repeat_interleave(ratio, dim=1)
 
-        # 4. Single-step recurrent delta rule (batched, float32)
+        # 4. Single-step recurrent delta rule (Triton kernel, in-place state update)
+        from nanovllm.layers.fla_ops.decode_kernel import gdn_decode_batched
         scale = self.head_k_dim ** -0.5
         q = query.float() * scale                   # [B, H, Dk]
         k = key.float()                              # [B, H, Dk]
         v = value.float()                            # [B, H, Dv]
         beta_val = b.sigmoid().float()               # [B, H]
-        g_val = (-self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)).exp()  # [B, H]
+        # g in log-space (NOT exp'd) for the Triton kernel
+        g_log = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)  # [B, H]
 
-        # Read state from buffer
-        state = self.recurrent_state_buf[slot_indices].float()  # [B, H, Dk, Dv]
-
-        # Decay: state *= g
-        state = state * g_val.unsqueeze(-1).unsqueeze(-1)       # [B, H, Dk, Dv]
-        # Recall: kv_mem = (state * k).sum(Dk)
-        kv_mem = (state * k.unsqueeze(-1)).sum(dim=-2)           # [B, H, Dv]
-        # Delta update: delta = (v - kv_mem) * beta
-        delta = (v - kv_mem) * beta_val.unsqueeze(-1)            # [B, H, Dv]
-        # Write: state += outer(k, delta)
-        state = state + k.unsqueeze(-1) * delta.unsqueeze(-2)    # [B, H, Dk, Dv]
-        # Query: output = (state * q).sum(Dk)
-        output = (state * q.unsqueeze(-1)).sum(dim=-2)           # [B, H, Dv]
-
-        # Write state back to buffer (cast float32 → buffer dtype)
-        self.recurrent_state_buf[slot_indices] = state.to(self.recurrent_state_buf.dtype)
+        # Triton kernel: updates state_buf in-place, returns output
+        output = gdn_decode_batched(
+            q, k, v, g_log, beta_val,
+            self.recurrent_state_buf,
+            slot_indices,
+        )  # [B, H, Dv]
 
         # 5. RMSNorm + gate + output projection
         output = output.to(hidden_states.dtype)
@@ -725,32 +733,29 @@ class Qwen3_5Experts(nn.Module):
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         """Dense gather-based dispatch — CUDA Graph compatible for decode.
-        Iterates over top_k slots (fixed count), gathers per-token expert weights,
-        and uses batched matmul. All tensor shapes are fixed regardless of routing."""
-        final = torch.zeros_like(hidden_states)
+        Batches all top_k experts in a single gather+bmm for efficiency."""
+        N = hidden_states.shape[0]
         top_k = top_k_indices.shape[1]
 
-        for k in range(top_k):
-            idx = top_k_indices[:, k]           # [N] expert index per token
-            w = top_k_weights[:, k:k+1]         # [N, 1] routing weight
+        # Gather all expert weights at once: [N*top_k, ...]
+        flat_idx = top_k_indices.reshape(-1)                    # [N*top_k]
+        gate_up_w = self.gate_up_proj[flat_idx]                 # [N*top_k, 2*inter, hidden]
+        down_w = self.down_proj[flat_idx]                       # [N*top_k, hidden, inter]
 
-            # Gather expert parameters for each token's selected expert
-            # gate_up_proj: [num_experts, 2*inter, hidden] -> [N, 2*inter, hidden]
-            # down_proj:    [num_experts, hidden, inter]   -> [N, hidden, inter]
-            gate_up_w = self.gate_up_proj[idx]
-            down_w = self.down_proj[idx]
+        # Expand hidden states: [N, hidden] -> [N*top_k, hidden]
+        h_expand = hidden_states.repeat_interleave(top_k, dim=0)  # [N*top_k, hidden]
 
-            # Batched matmul: gate_up projection
-            # [N, 2*inter, hidden] @ [N, hidden, 1] -> [N, 2*inter]
-            x = torch.bmm(gate_up_w, hidden_states.unsqueeze(-1)).squeeze(-1)
-            gate, up = x.chunk(2, dim=-1)
-            x = F.silu(gate) * up               # [N, inter]
+        # Batched gate_up projection
+        x = torch.bmm(gate_up_w, h_expand.unsqueeze(-1)).squeeze(-1)  # [N*top_k, 2*inter]
+        gate, up = x.chunk(2, dim=-1)
+        x = F.silu(gate) * up                                  # [N*top_k, inter]
 
-            # Batched matmul: down projection
-            # [N, hidden, inter] @ [N, inter, 1] -> [N, hidden]
-            x = torch.bmm(down_w, x.unsqueeze(-1)).squeeze(-1)
+        # Batched down projection
+        x = torch.bmm(down_w, x.unsqueeze(-1)).squeeze(-1)     # [N*top_k, hidden]
 
-            final = final + w * x
+        # Reshape and weighted sum
+        x = x.view(N, top_k, -1)                               # [N, top_k, hidden]
+        final = (x * top_k_weights.unsqueeze(-1)).sum(dim=1)    # [N, hidden]
 
         return final
 

@@ -279,6 +279,15 @@ class AsyncEngineWrapper:
 
     def _engine_loop(self):
         """Background thread: continuously steps the engine."""
+        # Set Triton allocator in this thread (ContextVar is per-thread)
+        try:
+            import triton
+            import torch
+            def _alloc_fn(size, align, stream):
+                return torch.empty(size, dtype=torch.int8, device='cuda')
+            triton.set_allocator(_alloc_fn)
+        except Exception:
+            pass
         while self._running:
             # Wait until there's work
             self._has_work.wait(timeout=0.05)
