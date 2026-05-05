@@ -217,16 +217,18 @@ def torch_recurrent_gated_delta_rule(
 # Gated DeltaNet (Linear Attention)
 # ============================================================
 
+
 class Qwen3_5GatedDeltaNet(nn.Module):
     """
-    Gated DeltaNet linear attention layer.
+    Gated DeltaNet linear attention layer with tensor parallelism.
 
-    Maintains per-sequence recurrent state and conv state in pre-allocated GPU buffers
-    for CUDA Graph compatibility. During decode, all sequences are processed in a single
-    batched operation with no Python control flow.
-
-    During prefill: processes each sequence independently, writes final states to buffer.
-    During decode: reads/writes pre-allocated buffers via slot indices (CUDA Graph safe).
+    TP Strategy (matching vllm):
+    - Heads are sharded across TP ranks (each rank processes num_v_heads/tp_size heads)
+    - in_proj_qkv, in_proj_z, in_proj_a/b: ColumnParallelLinear (shard output dim)
+    - conv1d: per-rank channels with custom weight loader
+    - out_proj: RowParallelLinear (shard input dim, all_reduce output)
+    - Prefill: FlashInfer chunk_gated_delta_rule (float32 inter-chunk state)
+    - Decode: fused_recurrent_gated_delta_rule (float32 state, L2norm in kernel)
     """
 
     def __init__(
@@ -240,23 +242,39 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         rms_norm_eps: float = 1e-6,
     ):
         super().__init__()
+        tp_size = dist.get_world_size()
+        tp_rank = dist.get_rank()
+
         self.hidden_size = hidden_size
-        self.num_k_heads = num_k_heads
-        self.num_v_heads = num_v_heads
         self.head_k_dim = head_k_dim
         self.head_v_dim = head_v_dim
-        self.key_dim = num_k_heads * head_k_dim
-        self.value_dim = num_v_heads * head_v_dim
         self.conv_kernel_size = conv_kernel_size
+        self.tp_size = tp_size
+        self.tp_rank = tp_rank
 
-        # Projections
+        # Total (unsharded) dimensions
+        self.total_num_k_heads = num_k_heads
+        self.total_num_v_heads = num_v_heads
+        self.total_key_dim = num_k_heads * head_k_dim
+        self.total_value_dim = num_v_heads * head_v_dim
+        self.total_conv_dim = self.total_key_dim * 2 + self.total_value_dim
+
+        # Per-rank head counts
+        self.num_k_heads = num_k_heads // tp_size
+        self.num_v_heads = num_v_heads // tp_size
+        self.key_dim = self.num_k_heads * head_k_dim
+        self.value_dim = self.num_v_heads * head_v_dim
         self.conv_dim = self.key_dim * 2 + self.value_dim
-        self.in_proj_qkv = nn.Linear(hidden_size, self.key_dim * 2 + self.value_dim, bias=False)
-        self.in_proj_z = nn.Linear(hidden_size, self.value_dim, bias=False)
-        self.in_proj_a = nn.Linear(hidden_size, self.num_v_heads, bias=False)
-        self.in_proj_b = nn.Linear(hidden_size, self.num_v_heads, bias=False)
 
-        # Causal conv1d (depthwise)
+        # Projections (ColumnParallelLinear with custom weight loaders)
+        self.in_proj_qkv = ColumnParallelLinear(hidden_size, self.total_conv_dim, bias=False)
+        self.in_proj_qkv.weight.weight_loader = self._qkv_weight_loader
+
+        self.in_proj_z = ColumnParallelLinear(hidden_size, self.total_value_dim, bias=False)
+        self.in_proj_a = ColumnParallelLinear(hidden_size, num_v_heads, bias=False)
+        self.in_proj_b = ColumnParallelLinear(hidden_size, num_v_heads, bias=False)
+
+        # Conv1d (depthwise, per-rank channels)
         self.conv1d = nn.Conv1d(
             in_channels=self.conv_dim,
             out_channels=self.conv_dim,
@@ -265,101 +283,160 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             groups=self.conv_dim,
             padding=conv_kernel_size - 1,
         )
+        self.conv1d.weight.weight_loader = self._conv1d_weight_loader
 
-        # Time step parameters
+        # Per-rank parameters
         self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
+        self.dt_bias.weight_loader = self._per_v_head_weight_loader
         A = torch.empty(self.num_v_heads).uniform_(0, 16)
         self.A_log = nn.Parameter(torch.log(A))
+        self.A_log.weight_loader = self._per_v_head_weight_loader
 
         # Output norm and projection
         self.norm = RMSNormGated(self.head_v_dim, eps=rms_norm_eps)
-        self.out_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
+        self.out_proj = RowParallelLinear(self.total_value_dim, hidden_size, bias=False)
 
-        # Pre-allocated state buffers (set by model_runner.allocate_linear_attn_states)
-        # recurrent_state_buf: [max_num_seqs, num_v_heads, head_k_dim, head_v_dim] float32
-        # conv_state_buf: [max_num_seqs, conv_dim, kernel_size - 1] model_dtype
+        # State buffers (set by model_runner.allocate_linear_attn_states)
         self.recurrent_state_buf: torch.Tensor | None = None
         self.conv_state_buf: torch.Tensor | None = None
+
+    def _qkv_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        """Custom loader: checkpoint [Q_all|K_all|V_all] → per-rank [Q_shard|K_shard|V_shard]."""
+        q_w = loaded_weight[:self.total_key_dim]
+        k_w = loaded_weight[self.total_key_dim:self.total_key_dim * 2]
+        v_w = loaded_weight[self.total_key_dim * 2:]
+        q_shard = q_w[self.tp_rank * self.key_dim:(self.tp_rank + 1) * self.key_dim]
+        k_shard = k_w[self.tp_rank * self.key_dim:(self.tp_rank + 1) * self.key_dim]
+        v_shard = v_w[self.tp_rank * self.value_dim:(self.tp_rank + 1) * self.value_dim]
+        param.data.copy_(torch.cat([q_shard, k_shard, v_shard], dim=0))
+
+    def _conv1d_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        """Custom loader: checkpoint [Q_conv|K_conv|V_conv] → per-rank shards."""
+        q_c = loaded_weight[:self.total_key_dim]
+        k_c = loaded_weight[self.total_key_dim:self.total_key_dim * 2]
+        v_c = loaded_weight[self.total_key_dim * 2:]
+        q_shard = q_c[self.tp_rank * self.key_dim:(self.tp_rank + 1) * self.key_dim]
+        k_shard = k_c[self.tp_rank * self.key_dim:(self.tp_rank + 1) * self.key_dim]
+        v_shard = v_c[self.tp_rank * self.value_dim:(self.tp_rank + 1) * self.value_dim]
+        param.data.copy_(torch.cat([q_shard, k_shard, v_shard], dim=0))
+
+    def _per_v_head_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        """Shard [total_v_heads] → [v_heads_per_rank]."""
+        start = self.tp_rank * self.num_v_heads
+        param.data.copy_(loaded_weight[start:start + self.num_v_heads])
 
     def _forward_prefill(
         self,
         hidden_states: torch.Tensor,
         slot_idx: int | None = None,
     ) -> torch.Tensor:
-        """Process a full sequence during prefill. Write final state to buffer slot if provided."""
+        """Prefill using FlashInfer (float32 state) with Triton fallback."""
         seq_len = hidden_states.shape[0]
         batch_size = 1
-        hidden_states_3d = hidden_states.unsqueeze(0)  # [1, seq_len, hidden_size]
+        hidden_states_3d = hidden_states.unsqueeze(0)
 
-        # Projections
-        mixed_qkv = self.in_proj_qkv(hidden_states_3d)  # [1, seq_len, conv_dim]
-        mixed_qkv = mixed_qkv.transpose(1, 2)  # [1, conv_dim, seq_len]
-
+        # Projections (per-rank outputs)
+        mixed_qkv = self.in_proj_qkv(hidden_states_3d)   # [1, seq_len, conv_dim]
+        mixed_qkv = mixed_qkv.transpose(1, 2)            # [1, conv_dim, seq_len]
         z = self.in_proj_z(hidden_states_3d)
         z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)
-
         b = self.in_proj_b(hidden_states_3d)
         a = self.in_proj_a(hidden_states_3d)
 
-        # Save conv state to buffer: last (kernel_size - 1) columns of pre-activation mixed_qkv
+        # Save conv state
         if slot_idx is not None and self.conv_state_buf is not None:
             self.conv_state_buf[slot_idx].copy_(
                 mixed_qkv[0, :, -(self.conv_kernel_size - 1):]
             )
 
-        # Causal conv1d + SiLU activation
+        # Causal conv1d + SiLU
         mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
         mixed_qkv = mixed_qkv.transpose(1, 2)
 
-        # Split into Q, K, V
+        # Split Q, K, V (per-rank)
         query, key, value = torch.split(
             mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1,
         )
-        query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
+        query = query.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+        key = key.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+        value = value.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
 
         beta = b.sigmoid()
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
+        # GQA expand if needed
         if self.num_v_heads // self.num_k_heads > 1:
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
-        # Chunk-based gated delta rule (Triton kernel) — fast for long sequences
-        from nanovllm.layers.fla_ops.chunk import chunk_gated_delta_rule as triton_chunk_gated_delta_rule
         save_state = (slot_idx is not None and self.recurrent_state_buf is not None)
-        
-        # Initial state: zeros [1, HV, V, K] (bfloat16 for chunk kernel)
-        initial_state = torch.zeros(
-            1, self.num_v_heads, self.head_v_dim, self.head_k_dim,
-            dtype=hidden_states.dtype, device=hidden_states.device,
-        )
-        
-        core_attn_out, last_recurrent_state = triton_chunk_gated_delta_rule(
-            q=query,         # [1, seq_len, H, K]
-            k=key,           # [1, seq_len, H, K]
-            v=value,         # [1, seq_len, HV, V]
-            g=g,             # [1, seq_len, HV] (log-space)
-            beta=beta,       # [1, seq_len, HV]
-            initial_state=initial_state,
-            output_final_state=save_state,
-            use_qk_l2norm_in_kernel=True,
-        )
 
-        if save_state and last_recurrent_state is not None:
-            # last_recurrent_state: [1, HV, V, K] -> buf[slot_idx] is [H, K, V]
-            # Transpose V,K -> K,V to match buffer layout
-            self.recurrent_state_buf[slot_idx].copy_(
-                last_recurrent_state.squeeze(0).transpose(-1, -2).to(self.recurrent_state_buf.dtype)
+        # Use FlashInfer (float32 inter-chunk state) — critical for TP precision
+        import sys
+        _VLLM_SITE = "/data1/waterliao/scripts/vllm-017/.cuda-vllm017/lib/python3.12/site-packages"
+        if _VLLM_SITE not in sys.path:
+            sys.path.insert(0, _VLLM_SITE)
+        try:
+            from flashinfer.gdn_prefill import chunk_gated_delta_rule as fi_chunk
+            from nanovllm.layers.fla_ops.l2norm import l2norm_fwd
+
+            # L2 norm Q, K
+            q_normed = l2norm_fwd(query)
+            k_normed = l2norm_fwd(key)
+
+            # Squeeze batch, prepare for FlashInfer
+            T = seq_len
+            q_3d = q_normed.squeeze(0).contiguous()   # [T, H_v, K]
+            k_3d = k_normed.squeeze(0).contiguous()   # [T, H_v, K]  (after GQA expand)
+            v_3d = value.squeeze(0).contiguous()       # [T, H_v, V]
+            g_2d = g.squeeze(0).contiguous().float()   # [T, H_v]
+            beta_2d = beta.squeeze(0).contiguous().float()  # [T, H_v]
+
+            h0 = torch.zeros(1, self.num_v_heads, self.head_v_dim, self.head_k_dim,
+                             dtype=torch.float32, device=hidden_states.device)
+            cu_seqlens = torch.tensor([0, T], dtype=torch.int64, device=hidden_states.device)
+
+            result = fi_chunk(
+                q=q_3d, k=k_3d, v=v_3d,
+                g=torch.exp(g_2d), beta=beta_2d,
+                initial_state=h0,
+                output_final_state=save_state,
+                cu_seqlens=cu_seqlens,
+            )
+            if save_state:
+                core_attn_out, last_recurrent_state = result
+            else:
+                core_attn_out = result
+                last_recurrent_state = None
+            core_attn_out = core_attn_out.unsqueeze(0)  # [1, T, H_v, V]
+
+        except ImportError:
+            # Fallback to Triton fla_ops
+            from nanovllm.layers.fla_ops.chunk import chunk_gated_delta_rule as triton_chunk
+            initial_state = torch.zeros(
+                1, self.num_v_heads, self.head_v_dim, self.head_k_dim,
+                dtype=hidden_states.dtype, device=hidden_states.device,
+            )
+            core_attn_out, last_recurrent_state = triton_chunk(
+                q=query, k=key, v=value, g=g, beta=beta,
+                initial_state=initial_state,
+                output_final_state=save_state,
+                use_qk_l2norm_in_kernel=True,
             )
 
-        # Apply gated RMSNorm
+        # Save state to buffer
+        if save_state and last_recurrent_state is not None:
+            # last_recurrent_state: [1, H_v, V, K] → buf[slot]: [H_v, V, K] (same layout)
+            self.recurrent_state_buf[slot_idx].copy_(
+                last_recurrent_state.squeeze(0).to(self.recurrent_state_buf.dtype)
+            )
+
+
+        # Norm + output projection
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
-
         output = self.out_proj(core_attn_out)
         return output.squeeze(0)
 
@@ -368,34 +445,25 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         hidden_states: torch.Tensor,
         slot_indices: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Batched decode: process all tokens simultaneously.
-        All tensor ops, no Python control flow → CUDA Graph compatible.
-
-        hidden_states: [B, hidden_size]
-        slot_indices: [B] int tensor mapping batch position to buffer slot
-        """
+        """Decode using fused_recurrent_gated_delta_rule (float32 state, L2norm in kernel)."""
         B = hidden_states.shape[0]
 
-        # 1. Linear projections (batched)
-        mixed_qkv = self.in_proj_qkv(hidden_states)   # [B, conv_dim]
-        z = self.in_proj_z(hidden_states)               # [B, value_dim]
-        a = self.in_proj_a(hidden_states)               # [B, num_v_heads]
-        b = self.in_proj_b(hidden_states)               # [B, num_v_heads]
+        # Projections
+        mixed_qkv = self.in_proj_qkv(hidden_states)
+        z = self.in_proj_z(hidden_states)
+        a = self.in_proj_a(hidden_states)
+        b = self.in_proj_b(hidden_states)
 
-        # 2. Conv1d with pre-allocated state buffer
-        mixed_qkv_col = mixed_qkv.unsqueeze(-1)                     # [B, conv_dim, 1]
-        conv_state = self.conv_state_buf[slot_indices]                # [B, conv_dim, kernel_size-1]
-        conv_input = torch.cat([conv_state, mixed_qkv_col], dim=-1)  # [B, conv_dim, kernel_size]
-        # Update conv state buffer: sliding window (drop oldest, keep newest kernel_size-1)
+        # Conv1d with state buffer
+        mixed_qkv_col = mixed_qkv.unsqueeze(-1)
+        conv_state = self.conv_state_buf[slot_indices]
+        conv_input = torch.cat([conv_state, mixed_qkv_col], dim=-1)
         self.conv_state_buf[slot_indices] = conv_input[:, :, 1:]
-        # Depthwise conv + activation
         mixed_qkv_act = F.silu(
             F.conv1d(conv_input, self.conv1d.weight, bias=None, padding=0, groups=self.conv_dim)
-        )  # [B, conv_dim, 1]
-        mixed_qkv_act = mixed_qkv_act.squeeze(-1)  # [B, conv_dim]
+        ).squeeze(-1)
 
-        # 3. Split Q, K, V and reshape
+        # Split Q, K, V
         query, key, value = mixed_qkv_act.split(
             [self.key_dim, self.key_dim, self.value_dim], dim=-1,
         )
@@ -403,34 +471,39 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         key = key.view(B, self.num_k_heads, self.head_k_dim)
         value = value.view(B, self.num_v_heads, self.head_v_dim)
 
-        # L2 norm on Q, K
-        query = l2norm(query, dim=-1)
-        key = l2norm(key, dim=-1)
-
-        # GQA expand k_heads → v_heads if needed
+        # GQA expand
         if self.num_v_heads // self.num_k_heads > 1:
             ratio = self.num_v_heads // self.num_k_heads
             query = query.repeat_interleave(ratio, dim=1)
             key = key.repeat_interleave(ratio, dim=1)
 
-        # 4. Single-step recurrent delta rule (Triton kernel, in-place state update)
-        from nanovllm.layers.fla_ops.decode_kernel import gdn_decode_batched
-        scale = self.head_k_dim ** -0.5
-        q = query.float() * scale                   # [B, H, Dk]
-        k = key.float()                              # [B, H, Dk]
-        v = value.float()                            # [B, H, Dv]
-        beta_val = b.sigmoid().float()               # [B, H]
-        # g in log-space (NOT exp'd) for the Triton kernel
-        g_log = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)  # [B, H]
+        # Compute gating
+        beta_val = b.sigmoid()
+        g_log = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
-        # Triton kernel: updates state_buf in-place, returns output
-        output = gdn_decode_batched(
-            q, k, v, g_log, beta_val,
-            self.recurrent_state_buf,
-            slot_indices,
-        )  # [B, H, Dv]
+        # Use fused_recurrent (does L2 norm + scale + state update in float32)
+        from nanovllm.layers.fla_ops.fused_recurrent import fused_recurrent_gated_delta_rule
+        q_4d = query.unsqueeze(1)       # [B, 1, H_v, K]
+        k_4d = key.unsqueeze(1)         # [B, 1, H_v, K]
+        v_4d = value.unsqueeze(1)       # [B, 1, H_v, V]
+        g_3d = g_log.unsqueeze(1)       # [B, 1, H_v]
+        beta_3d = beta_val.unsqueeze(1) # [B, 1, H_v]
 
-        # 5. RMSNorm + gate + output projection
+        # Read state: buf[slot, H_v, V, K] → [B, H_v, V, K] (same layout, no transpose)
+        state = self.recurrent_state_buf[slot_indices].contiguous()
+
+        o_4d, final_state = fused_recurrent_gated_delta_rule(
+            q=q_4d, k=k_4d, v=v_4d, g=g_3d, beta=beta_3d,
+            initial_state=state,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+        # Write state back: [B, H_v, V, K] → buffer (same layout)
+        self.recurrent_state_buf[slot_indices] = final_state.to(self.recurrent_state_buf.dtype)
+
+        # Norm + output projection
+        output = o_4d.squeeze(1)  # [B, H_v, V]
         output = output.to(hidden_states.dtype)
         output = output.reshape(B * self.num_v_heads, self.head_v_dim)
         z_flat = z.reshape(B * self.num_v_heads, self.head_v_dim)
@@ -438,16 +511,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         output = output.view(B, self.value_dim)
         return self.out_proj(output)
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Process hidden_states of shape [total_tokens, hidden_size].
-
-        Prefill: each sequence processed independently, state saved to buffer slots.
-        Decode: batched processing via pre-allocated buffers (CUDA Graph compatible).
-        """
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         from nanovllm.utils.context import get_context
         context = get_context()
 
@@ -459,7 +523,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 start = cu_seqlens[i].item()
                 end = cu_seqlens[i + 1].item()
                 seq_hidden = hidden_states[start:end]
-                # Get buffer slot index for this sequence
                 if (context.linear_attn_slot_indices is not None
                         and self.recurrent_state_buf is not None):
                     slot_idx = context.linear_attn_slot_indices[i].item()
@@ -469,20 +532,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 outputs.append(seq_out)
             return torch.cat(outputs, dim=0)
         else:
-            # Decode: batched processing with buffer slot indices
             if (context.linear_attn_slot_indices is not None
                     and self.recurrent_state_buf is not None):
                 return self._forward_decode_batched(
                     hidden_states, context.linear_attn_slot_indices
                 )
             else:
-                # Fallback for warmup (no buffer allocated yet)
                 return torch.zeros_like(hidden_states)
-
-
-# ============================================================
-# Full Attention (with output gating, partial rotary)
-# ============================================================
 
 class Qwen3_5FullAttention(nn.Module):
     """
@@ -589,11 +645,13 @@ class Qwen3_5FullAttention(nn.Module):
         self.k_norm = Qwen3_5RMSNorm(head_dim, eps=rms_norm_eps)
 
         # Attention kernel
+        # When KV is replicated and expanded to match Q heads, use num_heads for kv_heads
+        attn_kv_heads = self.num_heads if use_replicated_kv else self.num_kv_heads
         self.attn = Attention(
             self.num_heads,
             head_dim,
             self.scaling,
-            self.num_kv_heads,
+            attn_kv_heads,
         )
 
     def forward(
@@ -611,8 +669,20 @@ class Qwen3_5FullAttention(nn.Module):
         gate = gate.reshape(-1, self.num_heads * self.head_dim)
 
         # K, V projections
-        k = self.k_proj(hidden_states).view(-1, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(hidden_states).view(-1, self.num_kv_heads, self.head_dim)
+        k_full = self.k_proj(hidden_states).view(-1, self.total_num_kv_heads, self.head_dim)
+        v_full = self.v_proj(hidden_states).view(-1, self.total_num_kv_heads, self.head_dim)
+        # For GQA with TP: select the correct KV head(s) for this rank's Q heads
+        # Each rank's Q heads map to specific KV heads based on GQA ratio
+        if self.total_num_kv_heads < dist.get_world_size():
+            tp_rank = dist.get_rank()
+            gqa_ratio = self.total_num_heads // self.total_num_kv_heads
+            kv_head_idx = (tp_rank * self.num_heads) // gqa_ratio
+            # All Q heads on this rank map to the same KV head
+            k = k_full[:, kv_head_idx:kv_head_idx+1, :].expand(-1, self.num_heads, -1).contiguous()
+            v = v_full[:, kv_head_idx:kv_head_idx+1, :].expand(-1, self.num_heads, -1).contiguous()
+        else:
+            k = k_full
+            v = v_full
 
         # Apply Q/K norms (Qwen3.5 uses (1+w) style)
         query = self.q_norm(query)

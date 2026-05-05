@@ -102,16 +102,21 @@ class BlockManager:
         block_table = seq.block_table
         last_block = self.blocks[block_table[-1]]
         if len(seq) % self.block_size == 1:
-            assert last_block.hash != -1
+            # Need a new block; previous block should be full
+            if self.enable_prefix_caching:
+                assert last_block.hash != -1
             block_id = self.free_block_ids[0]
             self._allocate_block(block_id)
             block_table.append(block_id)
         elif len(seq) % self.block_size == 0:
-            assert last_block.hash == -1
-            token_ids = seq.block(seq.num_blocks-1)
-            prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
-            h = self.compute_hash(token_ids, prefix)
-            last_block.update(h, token_ids)
-            self.hash_to_block_id[h] = last_block.block_id
+            # Current block just became full — compute its hash for prefix caching
+            if self.enable_prefix_caching:
+                assert last_block.hash == -1
+                token_ids = seq.block(seq.num_blocks-1)
+                prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
+                h = self.compute_hash(token_ids, prefix)
+                last_block.update(h, token_ids)
+                self.hash_to_block_id[h] = last_block.block_id
         else:
-            assert last_block.hash == -1
+            if self.enable_prefix_caching:
+                assert last_block.hash == -1

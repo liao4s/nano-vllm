@@ -55,6 +55,7 @@ class ChatCompletionRequest(BaseModel):
     top_p: float = 1.0
     n: int = 1
     stop: Optional[Union[List[str], str]] = None
+    chat_template_kwargs: Optional[dict] = None
 
 class CompletionRequest(BaseModel):
     model: str = ""
@@ -279,13 +280,14 @@ class AsyncEngineWrapper:
 
     def _engine_loop(self):
         """Background thread: continuously steps the engine."""
-        # Set Triton allocator in this thread (ContextVar is per-thread)
+        # Set Triton allocator in this thread (ContextVar is per-thread in Triton 3.6+)
         try:
-            import triton
-            import torch
-            def _alloc_fn(size, align, stream):
-                return torch.empty(size, dtype=torch.int8, device='cuda')
-            triton.set_allocator(_alloc_fn)
+            import triton, torch
+            from triton.runtime._allocation import Allocator
+            class _TorchAllocator(Allocator):
+                def __call__(self, size, align, stream):
+                    return torch.empty(size, dtype=torch.uint8, device="cuda:0").data_ptr()
+            triton.set_allocator(_TorchAllocator())
         except Exception:
             pass
         while self._running:
@@ -420,9 +422,11 @@ def create_app(engine: AsyncEngineWrapper, shutdown_event: asyncio.Event | None 
     async def chat_completions(request: ChatCompletionRequest):
         # Apply chat template
         messages = [{"role": m.role, "content": m.content} for m in request.messages]
+        tpl_kwargs = request.chat_template_kwargs or {}
         try:
             prompt = engine.tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True,
+                **tpl_kwargs,
             )
         except Exception:
             # Fallback: simple concatenation

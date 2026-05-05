@@ -45,7 +45,7 @@ class ModelRunner:
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank,
                                 timeout=datetime.timedelta(minutes=30))
         torch.cuda.set_device(rank)
-        # Set up Triton allocator (must be done per-process for TP)
+        # Set up Triton allocator (required for kernels needing scratch memory in Triton 3.6+)
         try:
             import triton
             from triton.runtime._allocation import Allocator
@@ -74,6 +74,12 @@ class ModelRunner:
 
         if self.world_size > 1:
             if rank == 0:
+                try:
+                    _stale = SharedMemory(name="nanovllm", create=False)
+                    _stale.close()
+                    _stale.unlink()
+                except FileNotFoundError:
+                    pass
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
                 dist.barrier()
             else:
@@ -126,6 +132,11 @@ class ModelRunner:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
+        # Cap warmup length for linear attention models to avoid OOM in Triton autotuner.
+        # The chunk kernel allocates O(T * H * V * K) intermediate state which is too large for T=200K.
+        if self._has_linear_attn:
+            max_model_len = min(max_model_len, 8192)
+            max_num_batched_tokens = min(max_num_batched_tokens, max_model_len)
         num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
         seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
         self.run(seqs, True)
@@ -150,7 +161,7 @@ class ModelRunner:
         dtype = hf_config.torch_dtype
         elem_size = dtype.itemsize
         # Per-slot bytes across all layers
-        recurrent_per_slot = num_layers * layer0.num_v_heads * layer0.head_k_dim * layer0.head_v_dim * elem_size
+        recurrent_per_slot = num_layers * layer0.num_v_heads * layer0.head_v_dim * layer0.head_k_dim * 4  # float32
         conv_per_slot = num_layers * layer0.conv_dim * (layer0.conv_kernel_size - 1) * elem_size
         bytes_per_slot = recurrent_per_slot + conv_per_slot
         # Use a conservative default: 32 slots ≈ 1GB for Qwen3.5-35B-A3B
@@ -236,9 +247,11 @@ class ModelRunner:
 
         max_slots = getattr(self, '_linear_attn_max_slots', min(128, self.config.max_num_seqs))
 
+        # Use float32 for recurrent state buffer to prevent numerical degradation
+        # during decode (model config specifies mamba_ssm_dtype=float32)
         self.linear_attn_recurrent_buf = torch.zeros(
-            num_layers, max_slots, num_v_heads, head_k_dim, head_v_dim,
-            dtype=dtype, device="cuda",
+            num_layers, max_slots, num_v_heads, head_v_dim, head_k_dim,
+            dtype=torch.float32, device="cuda",
         )
         self.linear_attn_conv_buf = torch.zeros(
             num_layers, max_slots, conv_dim, conv_kernel_size - 1,
