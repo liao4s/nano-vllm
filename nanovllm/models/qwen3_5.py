@@ -669,8 +669,8 @@ class Qwen3_5FullAttention(nn.Module):
         gate = gate.reshape(-1, self.num_heads * self.head_dim)
 
         # K, V projections
-        k_full = self.k_proj(hidden_states).view(-1, self.total_num_kv_heads, self.head_dim)
-        v_full = self.v_proj(hidden_states).view(-1, self.total_num_kv_heads, self.head_dim)
+        k_full = self.k_proj(hidden_states).view(-1, self.num_kv_heads, self.head_dim)
+        v_full = self.v_proj(hidden_states).view(-1, self.num_kv_heads, self.head_dim)
         # For GQA with TP: select the correct KV head(s) for this rank's Q heads
         # Each rank's Q heads map to specific KV heads based on GQA ratio
         if self.total_num_kv_heads < dist.get_world_size():
