@@ -371,29 +371,26 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         save_state = (slot_idx is not None and self.recurrent_state_buf is not None)
 
-        # Use FlashInfer (float32 inter-chunk state) — critical for TP precision
-        import sys
-        _VLLM_SITE = "/data1/waterliao/scripts/vllm-017/.cuda-vllm017/lib/python3.12/site-packages"
-        if _VLLM_SITE not in sys.path:
-            sys.path.insert(0, _VLLM_SITE)
+        h0 = torch.zeros(1, self.num_v_heads, self.head_v_dim, self.head_k_dim,
+                         dtype=torch.float32, device=hidden_states.device)
+
+        # Use FlashInfer GDN prefill kernel when available (float32 inter-chunk state,
+        # no O(T*H*V*K) intermediate tensors — essential for long-context without OOM).
+        # Falls back to Triton fla_ops for short sequences or when flashinfer is absent.
         try:
             from flashinfer.gdn_prefill import chunk_gated_delta_rule as fi_chunk
             from nanovllm.layers.fla_ops.l2norm import l2norm_fwd
 
-            # L2 norm Q, K
             q_normed = l2norm_fwd(query)
             k_normed = l2norm_fwd(key)
 
-            # Squeeze batch, prepare for FlashInfer
             T = seq_len
-            q_3d = q_normed.squeeze(0).contiguous()   # [T, H_v, K]
-            k_3d = k_normed.squeeze(0).contiguous()   # [T, H_v, K]  (after GQA expand)
-            v_3d = value.squeeze(0).contiguous()       # [T, H_v, V]
-            g_2d = g.squeeze(0).contiguous().float()   # [T, H_v]
+            q_3d = q_normed.squeeze(0).contiguous()        # [T, H_v, K]
+            k_3d = k_normed.squeeze(0).contiguous()        # [T, H_v, K]
+            v_3d = value.squeeze(0).contiguous()            # [T, H_v, V]
+            g_2d = g.squeeze(0).contiguous().float()        # [T, H_v]
             beta_2d = beta.squeeze(0).contiguous().float()  # [T, H_v]
 
-            h0 = torch.zeros(1, self.num_v_heads, self.head_v_dim, self.head_k_dim,
-                             dtype=torch.float32, device=hidden_states.device)
             cu_seqlens = torch.tensor([0, T], dtype=torch.int64, device=hidden_states.device)
 
             result = fi_chunk(
@@ -411,15 +408,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out = core_attn_out.unsqueeze(0)  # [1, T, H_v, V]
 
         except ImportError:
-            # Fallback to Triton fla_ops
+            # Fallback to Triton fla_ops (may OOM on very long sequences)
             from nanovllm.layers.fla_ops.chunk import chunk_gated_delta_rule as triton_chunk
-            initial_state = torch.zeros(
-                1, self.num_v_heads, self.head_v_dim, self.head_k_dim,
-                dtype=hidden_states.dtype, device=hidden_states.device,
-            )
             core_attn_out, last_recurrent_state = triton_chunk(
                 q=query, k=key, v=value, g=g, beta=beta,
-                initial_state=initial_state,
+                initial_state=h0,
                 output_final_state=save_state,
                 use_qk_l2norm_in_kernel=True,
             )
